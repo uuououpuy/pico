@@ -118,6 +118,7 @@ class Pico:
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
+        self.langfuse = self._init_langfuse()
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -753,7 +754,83 @@ class Pico:
         self.last_durable_superseded = superseded
         return promoted, rejections, superseded
 
+    @staticmethod
+    def _init_langfuse():
+        """按环境变量初始化 Langfuse 客户端；未配置时返回 None。"""
+        if not (os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")):
+            # benchmark 等入口不经过 CLI 的 load_project_env，这里从项目 .env 兜底加载一次。
+            try:
+                from .config import load_project_env
+                load_project_env(Path.cwd())
+            except Exception:
+                pass
+        if not (os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")):
+            return None
+        try:
+            from langfuse import get_client
+            return get_client()
+        except Exception:
+            return None
+
+    def _langfuse_usage(self):
+        metadata = getattr(self.model_client, "last_completion_metadata", {}) or {}
+        usage = {}
+        for key in ("input_tokens", "output_tokens", "total_tokens", "cached_tokens"):
+            value = metadata.get(key)
+            if isinstance(value, int):
+                usage[key] = value
+        return usage or None
+
+    def _complete(self, prompt, prompt_cache_key, prompt_cache_retention):
+        if self.langfuse is None:
+            return self.model_client.complete(
+                prompt, self.max_new_tokens,
+                prompt_cache_key=prompt_cache_key,
+                prompt_cache_retention=prompt_cache_retention,
+            )
+        model = getattr(self.model_client, "model", "") or self.model_client.__class__.__name__
+        with self.langfuse.start_as_current_observation(
+            as_type="generation", name="model_complete", model=model, input=prompt
+        ) as generation:
+            raw = self.model_client.complete(
+                prompt, self.max_new_tokens,
+                prompt_cache_key=prompt_cache_key,
+                prompt_cache_retention=prompt_cache_retention,
+            )
+            update = {"output": raw}
+            usage = self._langfuse_usage()
+            if usage:
+                update["usage_details"] = usage
+            generation.update(**update)
+            return raw
+
+    def _run_tool_with_trace(self, name, args):
+        if self.langfuse is None:
+            return self.run_tool(name, args)
+        with self.langfuse.start_as_current_observation(
+            as_type="tool", name=f"tool:{name}", input={"name": name, "args": args}
+        ) as span:
+            result = self.run_tool(name, args)
+            span.update(output=result)
+            return result
+
     def ask(self, user_message):
+        """执行一次 agent 回合，并在启用 Langfuse 时上报为一条 trace。
+
+        只有设置了 LANGFUSE_PUBLIC_KEY 和 LANGFUSE_SECRET_KEY 环境变量时
+        才会启用观测；否则直接走原来的 `_ask`，行为与之前完全一致。
+        """
+        if self.langfuse is None:
+            return self._ask(user_message)
+        with self.langfuse.start_as_current_observation(
+            as_type="span", name=clip(user_message, 80) or "pico-run", input=user_message
+        ) as span:
+            final = self._ask(user_message)
+            span.update(output=final)
+        self.langfuse.flush()
+        return final
+
+    def _ask(self, user_message):
         """执行一次完整的 agent 回合，直到产出最终答案或命中停止条件。
 
         为什么存在：
@@ -870,12 +947,7 @@ class Pico:
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
             model_started_at = time.monotonic()
-            raw = self.model_client.complete(
-                prompt,
-                self.max_new_tokens,
-                prompt_cache_key=prompt_cache_key,
-                prompt_cache_retention=prompt_cache_retention,
-            )
+            raw = self._complete(prompt, prompt_cache_key, prompt_cache_retention)
             completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
             if completion_metadata:
                 # 把后端返回的 usage/cache 统计并回 prompt_metadata，
@@ -900,7 +972,7 @@ class Pico:
                 args = payload.get("args", {})
                 task_state.record_tool(name)
                 tool_started_at = time.monotonic()
-                result = self.run_tool(name, args)
+                result = self._run_tool_with_trace(name, args)
                 self.record(
                     {
                         "role": "tool",
